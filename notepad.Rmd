@@ -1,0 +1,398 @@
+---
+title: 'Network Models'
+author: "Sandeep Joshi"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# C:\Users\Sandeep\Desktop\540\Final project\replies
+getwd()
+```
+
+
+```{r}
+# rm(list = ls(all.names = TRUE))
+```
+```{r}
+# gcinfo(verbose = F)
+```
+
+
+## Load the libraries + functions
+
+```{r}
+library(files)
+library(googleLanguageR)
+library(tidytext)
+library(stringr)
+library(tidyr)
+library(tm)
+library(syuzhet)
+library(topicmodels)
+library(tidyverse)
+library(slam)
+library(textstem)
+library(reshape2)
+library(reticulate)
+library(cluster)
+library(factoextra)
+library(ggplot2)
+library(reshape2)
+library(viridis)
+library(hrbrthemes)
+library(knitr)
+library(dplyr)
+library(papaja)
+```
+
+```{r}
+options(scipen = 999)
+```
+
+
+
+# Load Data in R
+```{r}
+replies_index = list.files('replies')
+
+# load tweet and its replies.
+tweets_df <-  read.csv2('Practice Tweets.csv', stringsAsFactors=FALSE, sep = ',', numerals = c("no.loss"))
+tweets_df[,c('ID')] <- sapply(tweets_df[,c('ID')], as.String)
+tweets_df$Topic_terms_2 = tweets_df$Topic_terms_1 = ''  # instantiate new column for storing Topic models
+```
+
+
+# Save/ Load the Data models which takes long time to churn out
+```{r}
+# save.image("~/all_data.RData")
+load("~/all_data.RData")
+```
+
+
+# Clean Data
+```{r}
+# Clean tweets
+clean_replies <- function(reply) {
+  clean_tweet <- str_remove_all(reply, "@.*?(\\s+?|$)|^RT |http.*?(\\s+?|$)") # To remove @twitter handles and Retweet tag.
+  clean_tweet <- tolower(clean_tweet)
+  clean_tweet <- str_squish(str_trim(clean_tweet))
+  # Not removing punctuations as some libraries use emoticons to analyze tweets
+  clean_tweet <- removeWords(clean_tweet, stopwords('en')) # delete stopwords from text
+  clean_tweet <- stem_strings(clean_tweet) # stemming. Might need to remove it as it can confuse certain sentiment analyses
+  return(clean_tweet)
+}
+```
+
+# Check if we have reply data for the Tweet
+```{r}
+# Check if we have replies data for the tweet using conversation id
+check_replies <- function(tweet) {
+  reply_file = paste0(tweet[,3], ".csv")
+  if (reply_file %in% replies_index){
+    # reply found, work with tweet
+    cat("Tweet: ", tweet[,8], " ")
+    cat("Likes: ", tweet[,7], "and Retweets: ", tweet[,6], ". ")
+    reply_file <- paste0('replies/', reply_file)
+    cat("Found replies file: ", reply_file)
+    reply_df <- read.csv(reply_file)
+    cat("Number of replies found: ", nrow(reply_df), ". \n")
+    reply_df$Text <- lapply(reply_df$Text, clean_replies)
+    return(reply_df)
+  } 
+  else {
+    return(NULL)
+  }
+}
+```
+
+
+# Running sentiment analysis on tweets
+```{r}
+sentiment_score <- function(tweet) {
+  # Syuzhet. Other methods are “bing”, “afinn”, “nrc”, and “stanford”
+  # browser()
+  return(get_nrc_sentiment(tweet))
+}
+
+# Topic modeling on tweets to 2 topics
+topic_model <- function(tweet_col) {
+  reply_corpus <- Corpus(VectorSource(tweet_col))
+  # Stemming, stop words have been taken care of earlier
+  import_mat <- DocumentTermMatrix(reply_corpus, control = list(stemming =TRUE,
+                                                                stopwords = TRUE,
+                                                                minWordLength = 3, # This keeps the data out of sync
+                                                                removeNumbers = TRUE,
+                                                                removePunctuation =TRUE))
+  import_weight = tapply(import_mat$v/row_sums(import_mat)[import_mat$i], 
+                       import_mat$j, 
+                       mean) *
+    log2(nDocs(import_mat)/col_sums(import_mat > 0))
+  
+  #ignore very frequent and 0 terms
+  import_mat = import_mat[ row_sums(import_mat) > 0, ]
+  
+  # 2 topics and random seed of 7
+  LDA_gibbs = LDA(import_mat, k = 2, method = "Gibbs", 
+                control = list(seed = 7, burnin = 1000, 
+                               thin = 100, iter = 1000))
+  # See Topic modelings values to verify all indicators are within control and expected range
+  cat("LDA Gibb's Alpha: ", LDA_gibbs@alpha, 
+      "entropy: ", mean(apply(posterior(LDA_gibbs)$topics, 1, function(z) - sum(z * log(z)))))
+  
+  # Return lists from models so that they can be added to df. Complete model doesn't work
+  return(list("topics" = tidy(LDA_gibbs, matrix = "gamma"), "terms" = terms(LDA_gibbs, 20)))
+}
+
+```
+
+
+
+```{r}
+get_all_modeling_data <- function(tweet_id) {
+    
+    sprintf("For tweet id: %s ", tweet_id)
+    replies = check_replies(tweets_df[tweets_df$ID == tweet_id,])
+    # Delete blank replies as this causes issues later on with DF operations.
+    replies <- replies[!grepl("^\\s*$",replies$Text),]
+    
+    if (!is.null(replies)) {
+      replies$Topic_category <- 0
+      # Do sentiment analysis for each reply
+      replies <- cbind(replies, bind_rows(lapply(replies$Text, sentiment_score)))
+      sprintf("Sentiment analysis done for all replies on Tweet %s\n", tweet_id)
+      
+      # Do Topic modeling for all replies.
+      temp_model <- topic_model(replies$Text)  
+      
+      # Add top terms in all replies corpus to Tweet data
+      Topic_terms_1 <- toString(temp_model$terms[,1])
+      Topic_terms_2 <- toString(temp_model$terms[,2])
+
+      
+      # Add Topic category to the reply, determined by highest beta value. Equal values are not classified.
+      temp_topics <- temp_model$topics %>% group_by(document) %>% 
+        filter(gamma==max(gamma)) %>% 
+        arrange(document, topic)
+      temp_topics <- temp_topics %>% filter(gamma != 0.5000000) %>% select(document, topic)
+      
+      for (j in 1:nrow(replies)) {
+        replies[j,]$Topic_category <- toString(temp_topics[temp_topics$document==toString(j),]$topic)
+      }
+      
+      # remove temp_model from memory to save space
+      rm(list=c('temp_model', 'temp_topics'))
+      
+      sprintf("Topic Modelling done for Tweet %s", tweet_id)
+      return(list("replies"=replies, "topic_terms1"=Topic_terms_1, "topic_terms2"=Topic_terms_2))
+    }
+}
+```
+
+
+```{r}
+# Tweet: 1335775535717289984
+tweet_id = '1335775535717289984'
+temp_reply <- get_all_modeling_data(tweet_id)
+reply_model_1335775535717289984 <- temp_reply$replies
+tweets_df[tweets_df$ID == tweet_id,]$Topic_terms_1 <- toString(temp_reply$topic_terms1)
+tweets_df[tweets_df$ID == tweet_id,]$Topic_terms_2 <- toString(temp_reply$topic_terms2)
+
+
+# Tweet: 1335971721262796801
+tweet_id = '1335971721262796801'
+temp_reply <- get_all_modeling_data(tweet_id)
+reply_model_1335971721262796801 <- temp_reply$replies
+tweets_df[tweets_df$ID == tweet_id,]$Topic_terms_1 <- toString(temp_reply$topic_terms1)
+tweets_df[tweets_df$ID == tweet_id,]$Topic_terms_2 <- toString(temp_reply$topic_terms2)
+
+# Tweet: 1335984976521801733
+tweet_id = '1335984976521801733'
+temp_reply <- get_all_modeling_data(tweet_id)
+reply_model_1335984976521801733 <- temp_reply$replies
+tweets_df[tweets_df$ID == tweet_id,]$Topic_terms_1 <- toString(temp_reply$topic_terms1)
+tweets_df[tweets_df$ID == tweet_id,]$Topic_terms_2 <- toString(temp_reply$topic_terms2)
+
+# Tweet: 1336148836495069185
+tweet_id = '1336148836495069185'
+temp_reply <- get_all_modeling_data(tweet_id)
+reply_model_1336148836495069185 <- temp_reply$replies
+tweets_df[tweets_df$ID == tweet_id,]$Topic_terms_1 <- toString(temp_reply$topic_terms1)
+tweets_df[tweets_df$ID == tweet_id,]$Topic_terms_2 <- toString(temp_reply$topic_terms2)
+
+# Tweet: 1336318760106471424
+tweet_id = '1336318760106471424'
+temp_reply <- get_all_modeling_data(tweet_id)
+reply_model_1336318760106471424 <- temp_reply$replies
+tweets_df[tweets_df$ID == tweet_id,]$Topic_terms_1 <- toString(temp_reply$topic_terms1)
+tweets_df[tweets_df$ID == tweet_id,]$Topic_terms_2 <- toString(temp_reply$topic_terms2)
+
+# Tweet: 1336110929856040960
+tweet_id = '1336110929856040960'
+temp_reply <- get_all_modeling_data(tweet_id)
+reply_model_1336110929856040960 <- temp_reply$replies
+tweets_df[tweets_df$ID == tweet_id,]$Topic_terms_1 <- toString(temp_reply$topic_terms1)
+tweets_df[tweets_df$ID == tweet_id,]$Topic_terms_2 <- toString(temp_reply$topic_terms2)
+
+
+# Tweet: 1336112582424473600
+tweet_id = '1336112582424473600'
+temp_reply <- get_all_modeling_data(tweet_id)
+reply_model_1336112582424473600 <- temp_reply$replies
+tweets_df[tweets_df$ID == tweet_id,]$Topic_terms_1 <- toString(temp_reply$topic_terms1)
+tweets_df[tweets_df$ID == tweet_id,]$Topic_terms_2 <- toString(temp_reply$topic_terms2)
+
+```
+
+
+# Calculate sentiment metadata for Tweet
+```{r}
+tweet_ids <- c('1335775535717289984', '1335971721262796801', '1335984976521801733', '1336148836495069185', '1336318760106471424', '1336110929856040960', '1336112582424473600')
+meta_cols <- c('anger', 'anticipation', 'disgust','fear','joy','sadness','surprise','trust','positive','negative')
+
+
+replies_metadata_df <- data.frame(row.names = c('id', meta_cols))
+
+for (tweet_id in tweet_ids) {
+  temp_reply_df <- get(paste0('reply_model_', tweet_id))
+  # If they get more re-tweet or likes we should multiple emotion (?)
+  replies_metadata_df <- rbind(replies_metadata_df, lapply(c('id'=tweet_id, unlist(colSums(temp_reply_df[meta_cols], na.rm = TRUE))), unlist)) 
+} 
+
+ggplot(melt(replies_metadata_df[1:9], id.vars = c('id')), aes(fill=variable, y=value, x=id)) + ggtitle("Cumulative reaction to Presiden't Tweet") + xlab("Tweet ID") + ylab("Sentiment Score") +
+    geom_bar(position="stack", stat="identity", color = "black") + scale_fill_manual(values=c("#FF9900", "#CCFF33", "#CC9900", "#999999", "#66CCFF", "#CCCCCC", "#CCFFFF", "#99FF99")) + coord_flip()
+
+# Tweets
+print(kable(tweets_df[tweets_df$ID %in% replies_metadata_df$id,][,c('ID','Text')], caption = "President Trump's tweets"))
+```
+
+
+# Data Visualization for Tweet topics
+
+
+# Clustering Analysis
+```{r}
+cluster_plot <- function(tweet_id) {
+  temp_reply_df <- get(paste0('reply_model_', tweet_id))
+  temp_reply_df <- temp_reply_df %>% na_if("") %>% na.omit()
+  # factor_cols <- c('X', 'ID', 'Topic_category')
+  # temp_reply_df[factor_cols] <- lapply(temp_reply_df[factor_cols], factor)
+  
+  temp_reply_df <- temp_reply_df[meta_cols]
+
+  # distance <- get_dist(temp_reply_df[meta_cols], method = "euclidean") # maximum, manhattan #causing memory issues
+  # fviz_dist(distance, gradient = list(low = "#00AFBB", mid = "white", high = "#FC4E07"))
+  k2 <- kmeans(temp_reply_df, centers = 2, nstart = 25)
+  str(k2)
+  
+  # Randomly sample data for plotting Clusters
+  sample_size = 200
+  subsample_plot <- temp_reply_df[sample(nrow(temp_reply_df),sample_size),]
+  subsample_k2 <- k2
+  subsample_k2$cluster <- subsample_k2$cluster[row.names(subsample_plot)]
+  
+  temp_k2 <- subsample_k2
+  
+  subsample_plot <- fviz_cluster(subsample_k2, data = subsample_plot[meta_cols])
+  
+  
+  # Plotting aggregate reaction to Tweet
+  cluster_1 <- names(k2$cluster[k2$cluster==1])
+  cluster_2 <- names(k2$cluster[k2$cluster==2])
+  
+  hap_table <- matrix(c(sum(temp_reply_df[cluster_1,]$positive), sum(temp_reply_df[cluster_2,]$positive),
+                        sum(temp_reply_df[cluster_1,]$negative), sum(temp_reply_df[cluster_2,]$negative)), ncol = 2, byrow = T)
+  colnames(hap_table) <- c("Cluster 1", "Cluster 2")
+  rownames(hap_table) <- c("Positive", "Negative")
+  hap_table <- as.table(hap_table)
+  
+  plot_happiness <- barplot(hap_table, main=paste("Reaction to Tweet - ", tweet_id), 
+                            xlab ="Different Clusters of responses.", 
+                            col=c("green","red"), 
+                            legend = rownames(hap_table))
+  
+  return(list("cluster_plot" = subsample_plot, "plot_happiness" = plot_happiness, "centers" = k2$centers, "dist"= k2$size))
+}
+```
+
+# Tweet: https://t.co/j0jTBUR6jv
+## Fox News piece about President Trump's claim about Pennisylvania and supporting Fedral case againt the state.
+```{r}
+plot_data_1335775535717289984 <- cluster_plot("1335775535717289984")
+plot_data_1335775535717289984$cluster_plot
+print(kable(plot_data_1335775535717289984$centers, caption = "Cluster Centers are:"))
+print(kable(plot_data_1335775535717289984$dist, caption = "Distribution for replies in a cluster is: "))
+plot_data_1335775535717289984$plot_happiness
+print(kable(tweets_df[tweets_df$ID=='1335775535717289984',][,c('Topic_terms_1', 'Topic_terms_2')], caption = "Topic extracted from replies:"))
+```
+# Tweet: "The Republican Governor of Georgia refuses to do signature verification, which would give us an easy win. Whatâ€™s wrong with this guy? What is he hiding?"
+```{r}
+plot_data_1335971721262796801 <- cluster_plot("1335971721262796801")
+plot_data_1335971721262796801$cluster_plot
+print(kable(plot_data_1335971721262796801$centers, caption = "Cluster Centers are:"))
+print(kable(plot_data_1335971721262796801$dist, caption = "Distribution for replies in a cluster is: "))
+plot_data_1335971721262796801$plot_happiness
+print(kable(tweets_df[tweets_df$ID=='1335971721262796801',][,c('Topic_terms_1', 'Topic_terms_2')], caption = "Topic extracted from replies:"))
+```
+
+# Tweet: "https://t.co/dRQI4aAXDL?amp=1"  
+## "Proclamation on National Pearl Harbor Remembrance Day, 2020"
+```{r}
+plot_data_1335984976521801733 <- cluster_plot("1335984976521801733")
+plot_data_1335984976521801733$cluster_plot
+print(kable(plot_data_1335984976521801733$centers, caption = "Cluster Centers are:"))
+print(kable(plot_data_1335984976521801733$dist, caption = "Distribution for replies in a cluster is: "))
+plot_data_1335984976521801733$plot_happiness
+print(kable(tweets_df[tweets_df$ID=='1335984976521801733',][,c('Topic_terms_1', 'Topic_terms_2')], caption = "Topic extracted from replies:"))
+```
+
+# Tweet: "Georgia Lt. Governor @GeoffDuncanGA is a RINO Never Trumper who got himself elected as LG by falsely claiming to be â€œpro-Trumpâ€. Too dumb or corrupt to recognize massive evidence of fraud in GA & should be replaced! We need every great Georgian to call him out! #SpecialSession!"
+```{r}
+plot_data_1336148836495069185 <- cluster_plot("1336148836495069185")
+plot_data_1336148836495069185$cluster_plot
+print(kable(plot_data_1336148836495069185$centers, caption = "Cluster Centers are:"))
+print(kable(plot_data_1336148836495069185$dist, caption = "Distribution for replies in a cluster is: "))
+plot_data_1336148836495069185$plot_happiness
+print(kable(tweets_df[tweets_df$ID=='1336148836495069185',][,c('Topic_terms_1', 'Topic_terms_2')], caption = "Topic extracted from replies:"))
+```
+
+
+# Tweet: "I hope House Republicans will vote against the very weak National Defense Authorization Act (NDAA), which I will VETO. Must include a termination of Section 230 (for National Security purposes), preserve our National Monuments, & allow for 5G & troop reductions in foreign lands!"
+```{r}
+plot_data_1336318760106471424 <- cluster_plot("1336318760106471424")
+plot_data_1336318760106471424$cluster_plot
+print(kable(plot_data_1336318760106471424$centers, caption = "Cluster Centers are:"))
+print(kable(plot_data_1336318760106471424$dist, caption = "Distribution for replies in a cluster is: "))
+plot_data_1336318760106471424$plot_happiness
+print(kable(tweets_df[tweets_df$ID=='1336318760106471424',][,c('Topic_terms_1', 'Topic_terms_2')], caption = "Topic extracted from replies:"))
+
+```
+
+
+# Tweet: "RINOS @BrianKempGA, @GeoffDuncanGA, & Secretary of State Brad Raffensperger, will be solely responsible for the potential loss of our two GREAT Senators from Georgia, @sendavidperdue & @KLoeffler. Wonâ€™t call a Special Session or check for Signature Verification! People are ANGRY!"
+```{r}
+plot_data_1336110929856040960 <- cluster_plot("1336110929856040960")
+plot_data_1336110929856040960$cluster_plot
+print(kable(plot_data_1336110929856040960$centers, caption = "Cluster Centers are:"))
+print(kable(plot_data_1336110929856040960$dist, caption = "Distribution for replies in a cluster is: "))
+plot_data_1336110929856040960$plot_happiness
+print(kable(tweets_df[tweets_df$ID=='1336110929856040960',][,c('Topic_terms_1', 'Topic_terms_2')], caption = "Topic extracted from replies:"))
+```
+
+# Tweet: "â€œThese actions on the part of State Officials, making these changes, were violating the Constitution of the U.S. They were usurping power.â€ Ken Starr"
+```{r}
+plot_data_1336112582424473600 <- cluster_plot("1336112582424473600")
+plot_data_1336112582424473600$cluster_plot
+print(kable(plot_data_1336112582424473600$centers, caption = "Cluster Centers are:"))
+print(kable(plot_data_1336112582424473600$dist, caption = "Distribution for replies in a cluster is: "))
+plot_data_1336112582424473600$plot_happiness
+#print(kable(tweets_df[tweets_df$ID=='1336112582424473600',][,c('Topic_terms_1', 'Topic_terms_2')], caption = "Topic extracted from replies:"))
+papaja::apa_table(tweets_df[tweets_df$ID=='1336112582424473600',][,c('Topic_terms_1', 'Topic_terms_2')], caption = "Topic extracted from replies:")
+```
+
+
+
